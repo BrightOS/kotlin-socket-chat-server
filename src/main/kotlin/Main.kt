@@ -1,3 +1,10 @@
+import org.jetbrains.exposed.dao.IntEntity
+import org.jetbrains.exposed.dao.IntEntityClass
+import org.jetbrains.exposed.dao.id.EntityID
+import org.jetbrains.exposed.dao.id.IntIdTable
+import org.jetbrains.exposed.sql.*
+import org.jetbrains.exposed.sql.transactions.TransactionManager
+import org.jetbrains.exposed.sql.transactions.transaction
 import java.io.OutputStream
 import java.net.ServerSocket
 import java.net.Socket
@@ -8,18 +15,35 @@ import kotlin.concurrent.thread
 
 private const val PORT = 1805
 
+object Users : IntIdTable() {
+    val nick = varchar("nick", 50)
+    val password = varchar("password", 50)
+}
+
+class User(id: EntityID<Int>) : IntEntity(id) {
+    companion object : IntEntityClass<User>(Users)
+
+    var nick by Users.nick
+    var password by Users.password
+}
+
 fun main() {
+    Database.connect("jdbc:h2:mem:test;DB_CLOSE_DELAY=-1", driver = "org.h2.Driver")
+
+    transaction {
+        addLogger(StdOutSqlLogger)
+        SchemaUtils.create(Users)
+
+        User.new {
+            nick = "admin"
+            password = "admin"
+        }
+
+        println(Users.selectAll())
+    }
+
     val server = Server(PORT)
     server.setupServer()
-
-    val scanner = Scanner(System.`in`)
-    var input: String
-    do {
-        input = scanner.nextLine()
-        println(input)
-    } while (!input.contains("stop"))
-
-    server.shutdown()
 }
 
 class Server(private val port: Int) {
@@ -67,13 +91,26 @@ class Server(private val port: Int) {
                 }
                 return false
             }
+
+            override fun checkAuth(username: String, password: String): AuthStatus {
+                val result = transaction {
+                    Users.select { Users.nick eq username }.map { it[Users.password] }
+                }
+
+                if (result.size == 0)
+                    return AuthStatus.REGISTERED
+                else if (password in result)
+                    return AuthStatus.LOGGED
+                else
+                    return AuthStatus.WRONG_PASSWORD
+            }
         }
 
         connectionsThread = thread {
             while (true) {
                 val client = ClientHandler(server.accept(), clientActivityListener)
-                clients.add(client)
                 client.run()
+                clients.add(client)
             }
         }
 
@@ -98,22 +135,59 @@ interface ClientActivityListener {
     fun onClientDisconnected(client: String)
     fun onMessageReceived(client: String, message: String)
     fun isUsernameAlreadyTaken(newNickname: String): Boolean
+    fun checkAuth(username: String, password: String): AuthStatus
 }
+
+enum class AuthStatus { REGISTERED, WRONG_PASSWORD, LOGGED }
 
 class ClientHandler(
     private val client: Socket,
     private val clientActivityListener: ClientActivityListener
 ) {
+    private lateinit var currentThread: Thread
+
     private val reader: Scanner = Scanner(client.getInputStream())
     private val writer: OutputStream = client.getOutputStream()
-    private lateinit var currentThread: Thread
+    private var authorized = false
+
     var running: Boolean = false
     var username = "${clientID++}"
 
     fun run() {
         running = true
 
-        clientActivityListener.onClientConnected(username)
+        while (!authorized) {
+            write("Введите логин")
+            val username = reader.nextLine()
+            write("Введите пароль")
+            val password = reader.nextLine()
+
+            when (clientActivityListener.checkAuth(username, password)) {
+                AuthStatus.WRONG_PASSWORD -> {
+                    write("Неверный пароль. Попробуйте снова")
+                }
+
+                AuthStatus.LOGGED -> {
+                    write("Аутентификация прошла успешно!")
+                    this.username = username
+                    clientActivityListener.onClientConnected(username)
+                    authorized = true
+                }
+
+                AuthStatus.REGISTERED -> {
+                    write("Аккаунт успешно зарегистрирован!")
+                    transaction {
+                        User.new {
+                            nick = username
+                            this.password = password
+                        }
+                    }
+                    this.username = username
+                    clientActivityListener.onClientConnected(username)
+                    authorized = true
+                }
+            }
+        }
 
         currentThread = thread {
             while (running) {
